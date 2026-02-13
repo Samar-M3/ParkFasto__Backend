@@ -2,6 +2,26 @@ const ParkingLot = require("../models/ParkingLot.model");
 const ParkingSession = require("../models/ParkingSession.model");
 const Notification = require("../models/Notification.model");
 
+const resolveLotStatus = (occupiedSpots, totalSpots) =>
+  occupiedSpots >= totalSpots ? "full" : "available";
+
+const syncLotStatus = async (parkingLotId, occupiedDelta) => {
+  const updatedLot = await ParkingLot.findByIdAndUpdate(
+    parkingLotId,
+    { $inc: { occupiedSpots: occupiedDelta } },
+    { new: true },
+  );
+
+  if (!updatedLot) return null;
+
+  const newStatus = resolveLotStatus(updatedLot.occupiedSpots, updatedLot.totalSpots);
+  if (updatedLot.status !== newStatus) {
+    await ParkingLot.findByIdAndUpdate(parkingLotId, { status: newStatus });
+  }
+
+  return updatedLot;
+};
+
 /**
  * User Bookings Controller
  * Retrieves all parking history (active and completed) for the logged-in user.
@@ -102,7 +122,7 @@ exports.guardEntry = async (req, res, next) => {
       });
 
       // Update occupancy for walk-in
-      await ParkingLot.findByIdAndUpdate(parkingLotId, { $inc: { occupiedSpots: 1 } });
+      await syncLotStatus(parkingLotId, 1);
     } else {
       // If booking exists, activate it
       session.status = "active";
@@ -157,16 +177,8 @@ exports.guardExit = async (req, res, next) => {
     await session.save();
 
     // Free up the slot
-    const updatedLot = await ParkingLot.findByIdAndUpdate(
-      parkingLotId,
-      { $inc: { occupiedSpots: -1 } },
-      { new: true }
-    );
-
-    // Update lot status if needed
-    if (updatedLot && updatedLot.occupiedSpots < updatedLot.totalSpots) {
-      await ParkingLot.findByIdAndUpdate(parkingLotId, { status: "available" });
-    }
+    const slotsToRelease = Math.max(1, Number(session.slots) || 1);
+    await syncLotStatus(parkingLotId, -slotsToRelease);
 
     await Notification.create({
       user: userId,
@@ -214,21 +226,7 @@ exports.startSession = async (req, res, next) => {
     });
 
     // Update real-time occupancy of the chosen lot
-    const updatedLot = await ParkingLot.findByIdAndUpdate(
-      parkingLotId,
-      { $inc: { occupiedSpots: 1 } },
-      { new: true },
-    );
-
-    if (updatedLot) {
-      // Dynamic status update (Available/Full)
-      const newStatus =
-        updatedLot.occupiedSpots >= updatedLot.totalSpots
-          ? "full"
-          : "available";
-      
-      await ParkingLot.findByIdAndUpdate(parkingLotId, { status: newStatus });
-    }
+    await syncLotStatus(parkingLotId, 1);
 
     res.status(201).json({ success: true, data: session });
   } catch (error) {
@@ -240,11 +238,18 @@ exports.startSession = async (req, res, next) => {
 exports.bookParking = async (req, res, next) => {
   try {
     const { parkingLotId, slots = 1, startTime, endTime } = req.body;
+    const requestedSlots = Number(slots);
 
     if (!parkingLotId || !startTime || !endTime) {
       return res.status(400).json({
         success: false,
         message: "parkingLotId, startTime and endTime are required",
+      });
+    }
+    if (!Number.isInteger(requestedSlots) || requestedSlots < 1) {
+      return res.status(400).json({
+        success: false,
+        message: "slots must be a positive whole number",
       });
     }
 
@@ -256,7 +261,7 @@ exports.bookParking = async (req, res, next) => {
     }
 
     const available = lot.totalSpots - (lot.occupiedSpots || 0);
-    if (available < Number(slots)) {
+    if (available < requestedSlots) {
       return res.status(400).json({
         success: false,
         message: "Not enough available slots for requested booking",
@@ -270,29 +275,56 @@ exports.bookParking = async (req, res, next) => {
       vehicleType: lot.type === "bike" ? "bike" : "car",
       startTime: new Date(startTime),
       endTime: new Date(endTime),
-      slots: Number(slots),
+      slots: requestedSlots,
       status: "booked",
     });
 
     // Reserve slots by incrementing occupiedSpots
-    const updatedLot = await ParkingLot.findByIdAndUpdate(
-      parkingLotId,
-      { $inc: { occupiedSpots: Number(slots) } },
-      { new: true },
-    );
-
-    // Manually trigger status update since findByIdAndUpdate doesn't trigger pre-save hooks
-    if (updatedLot) {
-      const newStatus =
-        updatedLot.occupiedSpots >= updatedLot.totalSpots
-          ? "full"
-          : "available";
-      if (updatedLot.status !== newStatus) {
-        await ParkingLot.findByIdAndUpdate(parkingLotId, { status: newStatus });
-      }
-    }
+    await syncLotStatus(parkingLotId, requestedSlots);
 
     res.status(201).json({ success: true, data: session });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Cancel a booked parking session and release reserved slots
+exports.cancelBooking = async (req, res, next) => {
+  try {
+    const { bookingId } = req.params;
+
+    const session = await ParkingSession.findOne({
+      _id: bookingId,
+      user: req.user._id,
+      status: "booked",
+    }).populate("parkingLot", "name");
+
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        message: "Booked session not found or cannot be canceled",
+      });
+    }
+
+    session.status = "canceled";
+    session.endTime = new Date();
+    await session.save();
+
+    const slotsToRelease = Math.max(1, Number(session.slots) || 1);
+    await syncLotStatus(session.parkingLot?._id || session.parkingLot, -slotsToRelease);
+
+    await Notification.create({
+      user: req.user._id,
+      type: "booking",
+      title: "Booking Canceled",
+      message: `Your booking at ${session.parkingLot?.name || "the parking lot"} was canceled.`,
+      metadata: {
+        parkingLot: session.parkingLot?._id || session.parkingLot,
+        session: session._id,
+      },
+    });
+
+    res.status(200).json({ success: true, data: session });
   } catch (error) {
     next(error);
   }
@@ -326,23 +358,8 @@ exports.completeSession = async (req, res, next) => {
     await session.save();
 
     // Decrement occupied spots
-    const updatedLot = await ParkingLot.findByIdAndUpdate(
-      session.parkingLot._id,
-      { $inc: { occupiedSpots: -1 } },
-      { new: true },
-    );
-
-    if (updatedLot) {
-      const newStatus =
-        updatedLot.occupiedSpots >= updatedLot.totalSpots
-          ? "full"
-          : "available";
-      if (updatedLot.status !== newStatus) {
-        await ParkingLot.findByIdAndUpdate(session.parkingLot._id, {
-          status: newStatus,
-        });
-      }
-    }
+    const slotsToRelease = Math.max(1, Number(session.slots) || 1);
+    await syncLotStatus(session.parkingLot._id, -slotsToRelease);
 
     res.status(200).json({ success: true, data: session });
   } catch (error) {

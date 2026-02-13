@@ -5,6 +5,7 @@ const {
   startSession,
   bookParking,
   getUserBookings,
+  cancelBooking,
   completeSession,
   guardEntry,
   guardExit,
@@ -18,6 +19,7 @@ router.get("/active-session", isauthenticated, getActiveSession);
 router.post("/start-session", isauthenticated, startSession);
 router.post("/book", isauthenticated, bookParking);
 router.get("/bookings", isauthenticated, getUserBookings);
+router.patch("/bookings/:bookingId/cancel", isauthenticated, cancelBooking);
 router.post("/complete-session", isauthenticated, completeSession);
 
 // Guard routes

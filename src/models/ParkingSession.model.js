@@ -36,7 +36,7 @@ const parkingSessionSchema = new mongoose.Schema({
     },
     status: {
         type: String,
-        enum: ["booked", "active", "completed"],
+        enum: ["booked", "active", "completed", "canceled"],
         default: "active"
     }
 }, { timestamps: true });
