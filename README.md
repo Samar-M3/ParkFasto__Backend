@@ -7,7 +7,7 @@
 
 ## Project Overview
 This is the backend API for ParkFasto, the smart parking management system.  
-It provides endpoints for:
+It provides endpoints for
 
 - User authentication and management
 - Parking lot management (availability, booking, updates)
